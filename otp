@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import pwd
+import getpass
+import string
+import random
+import signal
+import base64
+import hashlib
+import time
+import struct
+import hmac
+
+TIMEOUT = 30
+
+def fail(*args, **kwargs):
+  print("\nTimed out after %d seconds" % (TIMEOUT))
+  sys.exit(1)
+
+def shell(command):
+  signal.alarm(0)
+  shell = pwd.getpwuid(os.getuid()).pw_shell
+  if command:
+    os.execl(shell, shell, '-c', command)
+  else:
+    os.execl(shell, shell, '-l')
+  sys.exit(0)
+
+def totp(key, length=6, hash=hashlib.sha1, period=30, drift=0):
+  counter = int(int(time.time()) / period) + drift
+  return hotp(key, counter, length=length, hash=hash, drift=0)
+
+def hotp(key, counter, length=6, hash=hashlib.sha1, drift=0):
+  counter = struct.pack('>Q', counter + drift)
+  key = base64.b32decode(key)
+
+  digest = hmac.new(key, counter, hash).digest()
+
+  offset = ord(digest[-1]) & 0xF
+  value = struct.unpack('>L', digest[offset:offset + 4])[0] & 0x7FFFFFFFL
+  code = ('%010d' % value)[-length:]
+  return code
+
+signal.signal(signal.SIGALRM, fail)
+signal.alarm(30)
+
+home = pwd.getpwuid(os.getuid()).pw_dir
+
+if '--login' in sys.argv:
+  auth_passed = True
+  home_network = False
+
+  if os.path.exists(home + '/.totp_exclude_commands'):
+    excluded_commands = open(home + '/.totp_exclude_commands').read().rstrip().split("\n")
+
+    excluded = os.environ.get('SSH_ORIGINAL_COMMAND','') in excluded_commands
+  else:
+    excluded = False
+
+  source_ip = os.environ.get('SSH_CLIENT','').split(' ')[0]
+
+  if source_ip == '127.0.0.1':
+    home_network = True
+  else:
+    if os.path.exists(home + '/.totp_home_network'):
+      network = '.'.join(source_ip.split('.')[0:3]) + '.'
+
+      if network == open(home + '/.totp_home_network').read().rstrip():
+        home_network = True
+
+  if not os.path.exists(home + '/.totp.lock'):
+    os.mkdir(home + '/.totp.lock', 0o700)
+
+  if os.path.exists(home + '/.totp') and not excluded and not home_network:
+    secret = open(home + '/.totp').read().rstrip()
+    auth_passed = False
+
+    if 'OTP' in os.environ:
+      i = os.environ['OTP']
+    else:
+      for i in range(0, 3):
+        sys.stderr.write("OTP: ")
+        sys.stderr.flush()
+        i = sys.stdin.readline().rstrip()
+
+        if i == totp(secret):
+          break
+
+        signal.alarm(30)
+        time.sleep(5)
+
+    if i == totp(secret):
+      auth_passed = True
+    else:
+      if os.path.exists(home + '/.scratch'):
+        scratch_codes = open(home + '/.scratch').read().rstrip()
+
+        if len(scratch_codes) >0:
+          scratch_codes = scratch_codes.split("\n")
+
+          if i in scratch_codes:
+            auth_passed = True
+            scratch_codes.pop(scratch_codes.index(i))
+
+            with open(home + '/.scratch','w') as f:
+              if len(scratch_codes) >0:
+                f.write("\n".join(scratch_codes))
+              else:
+                f.write('')
+
+  if auth_passed:
+    shell(os.environ.get('SSH_ORIGINAL_COMMAND',''))
+  else:
+    print("Authentication failed.")
+
+  sys.exit(1)
+
+if os.path.exists(home + '/.totp'):
+  sys.stdout.write("WARNING: ~/.totp already exists, overwrite? [y/N] ")
+  sys.stdout.flush()
+  i = sys.stdin.readline().rstrip().lower()
+
+  if i != 'y':
+    sys.exit(0)
+
+chars = string.ascii_letters + '234567'
+
+secret = ''
+for i in range(0,32):
+  secret += random.choice(chars)
+
+scratch = []
+for i in range(0,8):
+  code = ''
+  for j in range(0,6):
+    code += random.choice(string.digits)
+  scratch.append(code)
+
+print("\nsecret: %s\n" % (secret))
+
+print("scratch codes:\n")
+
+for code in scratch:
+  print(code)
+
+sys.stdout.write("\nenter code to confirm: ")
+sys.stdout.flush()
+
+code = sys.stdin.readline().rstrip()
+
+if code == totp(secret):
+  with open(home + '/.totp','w') as f:
+    f.write(secret)
+
+  os.chmod(home + '/.totp',0o600)
+
+  with open(home + '/.scratch','w') as f:
+    f.write("\n".join(scratch))
+
+  os.chmod(home + '/.scratch',0o600)
+
+  print("OK")
+else:
+  print("setup failed, code incorrect")
