@@ -13,7 +13,8 @@ import time
 import struct
 import hmac
 
-TIMEOUT = 30
+TIMEOUT     = 30
+ALLOW_DRIFT = 15
 
 def fail(*args, **kwargs):
   print("\nTimed out after %d seconds" % (TIMEOUT))
@@ -29,7 +30,8 @@ def shell(command):
   sys.exit(0)
 
 def totp(key, length=6, hash=hashlib.sha1, period=30, drift=0):
-  counter = int(int(time.time()) / period) + drift
+  ts = time.time() + drift
+  counter = int(int(ts) / period)
   return hotp(key, counter, length=length, hash=hash, drift=0)
 
 def hotp(key, counter, length=6, hash=hashlib.sha1, drift=0):
@@ -42,6 +44,18 @@ def hotp(key, counter, length=6, hash=hashlib.sha1, drift=0):
   value = struct.unpack('>L', digest[offset:offset + 4])[0] & 0x7FFFFFFFL
   code = ('%010d' % value)[-length:]
   return code
+
+def valid(key, code):
+  if totp(key) == code:
+    return True
+
+  if totp(key, drift=ALLOW_DRIFT) == code:
+    return True
+
+  if totp(key, drift=-ALLOW_DRIFT) == code:
+    return True
+
+  return False
 
 signal.signal(signal.SIGALRM, fail)
 signal.alarm(30)
@@ -67,8 +81,14 @@ if '--login' in sys.argv:
     if os.path.exists(home + '/.totp_home_network'):
       network = '.'.join(source_ip.split('.')[0:3]) + '.'
 
-      if network == open(home + '/.totp_home_network').read().rstrip():
-        home_network = True
+      for totp_home_network in open(home + '/.totp_home_network').read().rstrip().split("\n"):
+        if network == totp_home_network:
+          home_network = True
+
+    if os.path.exists(home + '/.totp_home_ips'):
+      for home_ip in open(home + '/.totp_home_ips').read().rstrip().split("\n"):
+        if source_ip == home_ip:
+          home_network = True
 
   if not os.path.exists(home + '/.totp.lock'):
     os.mkdir(home + '/.totp.lock', 0o700)
@@ -80,18 +100,21 @@ if '--login' in sys.argv:
     if 'OTP' in os.environ:
       i = os.environ['OTP']
     else:
+      is_valid = False
+
       for i in range(0, 3):
         sys.stderr.write("OTP: ")
         sys.stderr.flush()
         i = sys.stdin.readline().rstrip()
 
-        if i == totp(secret):
+        if valid(secret, i):
+          is_valid = True
           break
 
         signal.alarm(30)
         time.sleep(5)
 
-    if i == totp(secret):
+    if is_valid:
       auth_passed = True
     else:
       if os.path.exists(home + '/.scratch'):
